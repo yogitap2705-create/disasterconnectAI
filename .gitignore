@@ -1,0 +1,4 @@
+# Environment files and API keys
+.env
+**/.env
+*.env
