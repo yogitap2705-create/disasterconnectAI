@@ -241,6 +241,19 @@ DisasterConnect AI Team`,
         "[Report Email] reportedBy is missing from the request."
       );
     }
+    return res.status(201).json({
+  message: "Disaster Report Submitted Successfully",
+  disaster,
+  aiActionPlan: aiPlan,
+});
+
+} catch (error) {
+  console.error("[Create Disaster Error]:", error);
+  return res.status(500).json({
+    message: error.message,
+  });
+}
+};
 
 
 // ===============================
