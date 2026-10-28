@@ -1,39 +1,32 @@
+
 const nodemailer = require("nodemailer");
 const Notification = require("../models/Notification");
 
-/**
- * Universal Emergency Dispatch Email & Notification Service.
- * 
- * 1. Persists the dispatch transmission into MongoDB (guaranteeing in-app delivery).
- * 2. If EMAIL & EMAIL_PASSWORD are set in .env, sends real email via Gmail SMTP.
- * 3. If credentials are not set or SMTP fails, automatically generates an Ethereal preview
- *    or marks the message as delivered to the In-App Volunteer Dispatch Center.
- * 
- * @param {Object} options
- * @param {string} options.to - Recipient email address
- * @param {string} options.subject - Email subject
- * @param {string} [options.text] - Plain text
- * @param {string} [options.html] - HTML formatted email
- * @param {string} [options.recipientId] - User ObjectId
- * @param {string} [options.recipientName] - User full name
- * @param {string} [options.notificationType] - 'volunteer_assignment' | 'citizen_advisory' | 'incident_resolution'
- * @param {string} [options.disasterId] - Disaster ObjectId
- * @returns {Promise<{success: boolean, deliveryStatus: string, previewUrl?: string, notificationId?: string}>}
- */
 const sendEmail = async ({
   to,
   subject,
   text,
   html,
   recipientId,
-  recipientName = "Responder",
-  notificationType = "volunteer_assignment",
+  recipientName = "User",
+  notificationType = "citizen_advisory",
   disasterId,
 }) => {
   let notificationRecord = null;
 
+  // Validate recipient
+  if (!to) {
+    console.error("[Email Error] Recipient email is missing.");
+
+    return {
+      success: false,
+      deliveryStatus: "failed",
+      error: "Recipient email is missing",
+    };
+  }
+
+  // 1. Save the notification in MongoDB
   try {
-    // 1. Persist notification in database first (Guaranteed In-App Delivery)
     notificationRecord = await Notification.create({
       recipient: recipientId || null,
       recipientEmail: to,
@@ -43,35 +36,61 @@ const sendEmail = async ({
       messageHtml: html || text || "",
       notificationType,
       disasterId: disasterId || null,
-      deliveryStatus: "delivered_in_app",
+      deliveryStatus: "pending",
     });
-  } catch (dbErr) {
-    console.warn("[Dispatch Comms] Could not record in MongoDB Notification:", dbErr.message);
+
+    console.log(
+      "[Notification] Saved to database:",
+      notificationRecord._id
+    );
+  } catch (dbError) {
+    console.error(
+      "[Notification Database Error]:",
+      dbError.message
+    );
   }
 
-  const userEmail = process.env.EMAIL;
-  const userPassword = process.env.EMAIL_PASSWORD;
+  // 2. Read Gmail credentials from backend .env
+  const email = process.env.EMAIL;
+  const password = process.env.EMAIL_PASSWORD;
 
-  // 2. If real Gmail SMTP credentials are configured in .env, attempt sending
-  if (userEmail && userPassword && userEmail !== "your-email@gmail.com") {
+  // 3. Send a real email through Gmail
+  if (
+    email &&
+    password &&
+    email !== "your-email@gmail.com" &&
+    password !== "your_16_character_gmail_app_password"
+  ) {
+    let transporter;
+
     try {
-      const transporter = nodemailer.createTransport({
+      transporter = nodemailer.createTransport({
         service: "gmail",
         auth: {
-          user: userEmail,
-          pass: userPassword,
+          user: email,
+          pass: password,
         },
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 20000,
       });
 
+      // Verify the SMTP connection and credentials
+      await transporter.verify();
+
+      console.log("[Email] Gmail SMTP connection successful.");
+
       const info = await transporter.sendMail({
-        from: `"DisasterConnect AI Command" <${userEmail}>`,
+        from: `"DisasterConnect AI" <${email}>`,
         to,
         subject,
         text: text || "",
         html: html || undefined,
       });
 
-      console.log(`[Dispatch Comms] Real SMTP email sent to ${to} (Message ID: ${info.messageId})`);
+      console.log(
+        `[Email] SMTP accepted message for ${to}. Message ID: ${info.messageId}`
+      );
 
       if (notificationRecord) {
         notificationRecord.deliveryStatus = "sent_smtp";
@@ -85,64 +104,46 @@ const sendEmail = async ({
         messageId: info.messageId,
         notificationId: notificationRecord?._id,
       };
-    } catch (smtpErr) {
-      console.warn(`[Dispatch Comms] SMTP send failed (${smtpErr.message}). Falling back to In-App & Ethereal preview.`);
+    } catch (smtpError) {
+      console.error(
+        "[Gmail SMTP Error]:",
+        smtpError.message
+      );
+
       if (notificationRecord) {
-        notificationRecord.deliveryStatus = "failed_smtp";
-        await notificationRecord.save();
+        try {
+          notificationRecord.deliveryStatus = "failed_smtp";
+          await notificationRecord.save();
+        } catch (saveError) {
+          console.error(
+            "[Notification Update Error]:",
+            saveError.message
+          );
+        }
       }
-    }
-  } else {
-    console.log(
-      `[Dispatch Comms] Notice: Real SMTP skipped (EMAIL and EMAIL_PASSWORD not configured in backend .env). Message recorded for in-app Volunteer Dispatch Center.`
-    );
-  }
 
-  // 3. Fallback / Test Preview: Attempt Ethereal test mailbox for clickable browser preview
-  try {
-    const testAccount = await nodemailer.createTestAccount();
-    const testTransporter = nodemailer.createTransport({
-      host: "smtp.ethereal.email",
-      port: 587,
-      secure: false,
-      auth: {
-        user: testAccount.user,
-        pass: testAccount.pass,
-      },
-      connectionTimeout: 4000,
-      greetingTimeout: 4000,
-    });
-
-    const testInfo = await testTransporter.sendMail({
-      from: `"DisasterConnect AI Command" <alerts@disasterconnect.ai>`,
-      to,
-      subject,
-      text: text || "",
-      html: html || undefined,
-    });
-
-    const previewUrl = nodemailer.getTestMessageUrl(testInfo);
-    if (previewUrl) {
-      console.log(`[Dispatch Comms] Live Ethereal Email Preview: ${previewUrl}`);
-      if (notificationRecord) {
-        notificationRecord.deliveryStatus = "ethereal_preview";
-        notificationRecord.previewUrl = previewUrl;
-        await notificationRecord.save();
-      }
       return {
-        success: true,
-        deliveryStatus: "ethereal_preview",
-        previewUrl,
+        success: false,
+        deliveryStatus: "failed_smtp",
+        error: smtpError.message,
         notificationId: notificationRecord?._id,
       };
+    } finally {
+      if (transporter) {
+        transporter.close();
+      }
     }
-  } catch {
-    // If external ports are blocked, the message is still 100% saved in the DB
   }
 
+  // 4. Credentials missing: save in-app notification only
+  console.error(
+    "[Email Error] EMAIL or EMAIL_PASSWORD is missing or still a placeholder in backend .env."
+  );
+
   return {
-    success: true,
+    success: false,
     deliveryStatus: "delivered_in_app",
+    error: "Gmail credentials are not configured",
     notificationId: notificationRecord?._id,
   };
 };
